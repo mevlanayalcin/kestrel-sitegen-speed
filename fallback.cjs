@@ -627,6 +627,10 @@ function parseFrontMatterLines(text, pos, closePos) {
         return false;
       }
       vStart++;
+      for (let ls = vStart; ls < lEnd; ls++) {
+        const lc = text.charCodeAt(ls);
+        if (lc === 0x2028 || lc === 0x2029) { _fmErr = `line ${lineNo} is not "key: value"`; return false; }
+      }
     }
     if (kid === -1) { _fmErr = `unknown key "${text.slice(pos, kEnd)}"`; return false; }
 
@@ -867,11 +871,12 @@ function writeRelLinkHrefU8(a, b, hashPos, hasSpec, o) {
         const hash = target.indexOf('#');
         const frag = hash === -1 ? '' : target.slice(hash);
         const rawUrl = linkCtx.base + '/' + path + frag;
-        const href = !JSON_ASCII_SAFE_TEST.test(rawUrl) ? rawUrl : escapeHtml(rawUrl);
-        const j = href === rawUrl ? null : (JSON_NO_QUOT_RE.test(href) ? JSON.stringify(href).slice(1, -1) : null);
+        const isSafeAscii = !JSON_ASCII_SAFE_TEST.test(rawUrl);
+        const href = isSafeAscii ? rawUrl : escapeHtml(rawUrl);
+        const j = isSafeAscii ? null : (JSON_NO_QUOT_RE.test(href) ? JSON.stringify(href).slice(1, -1) : null);
         ensureUrlArena(urlArenaOff + href.length * 3 + (j !== null ? j.length * 3 : 0) + 16);
         const ao = urlArenaOff;
-        const an = href === rawUrl ? URL_ARENA_BUF.latin1Write(href, ao) : URL_ARENA_BUF.utf8Write(href, ao);
+        const an = isSafeAscii ? URL_ARENA_BUF.latin1Write(href, ao) : URL_ARENA_BUF.utf8Write(href, ao);
         urlArenaOff = ao + an;
         if (j === null) {
           cache.set(target, (ao < 0x80000 && an < 4096) ? ((ao << 12) | an) : { o: ao, n: an, jo: -1, jn: 0 });
@@ -3314,7 +3319,144 @@ function run(input, writer = null, rawU8 = null, rawBuf = null) {
 }
 
 
+
+function resolvePathFastFb(dirStr, dirParts, rel) {
+  const len = rel.length;
+  if (len === 0) return null;
+  const dLen = dirParts.length;
+  if (rel.indexOf('/') === -1 && rel !== '.' && rel !== '..') return dirStr === '' ? rel : dirStr + '/' + rel;
+  const parts = dLen === 0 ? [] : dirParts.slice();
+  let pos = 0;
+  while (pos <= len) {
+    let slash = rel.indexOf('/', pos); if (slash === -1) slash = len;
+    const segLen = slash - pos;
+    if (segLen === 0 || (segLen === 1 && rel.charCodeAt(pos) === 46)) {}
+    else if (segLen === 2 && rel.charCodeAt(pos) === 46 && rel.charCodeAt(pos + 1) === 46) { if (parts.length === 0) return null; parts.pop(); }
+    else parts.push(rel.slice(pos, slash));
+    pos = slash + 1;
+  }
+  return parts.join('/');
+}
+
+function resolveRelLinkSlow(a, b, hashPos, hasSpec, isNonAscii, hasBs, o, linkCtx, ctxOps) {
+  const { getU8, getBuf, getSrcI32, writeStrArena, tfCopyCode } = ctxOps;
+  let u = getU8(), buf = getBuf();
+  if (linkCtx.dirCache === null) linkCtx.dirCache = new Map();
+  const cache = linkCtx.dirCache;
+  const target = hasBs !== 0 ? JSON.parse('"' + buf.utf8Slice(a, b) + '"') : (isNonAscii === 0 ? buf.latin1Slice(a, b) : buf.utf8Slice(a, b));
+  const cached = cache.get(target);
+  if (cached !== undefined) {
+    if (cached === 0) {
+      linkCtx.broken.add('broken-link ' + linkCtx.sourcePath + ' -> ' + target);
+      if (hasSpec === 0 && hasBs === 0) { u.copyWithin(o, a, b); return o + (b - a); }
+      return tfCopyCode(a, b, o);
+    }
+    u.copyWithin(o, cached.o, cached.o + cached.n);
+    return o + cached.n;
+  }
+  const rel = hashPos === -1 ? target : (hasBs !== 0 ? JSON.parse('"' + buf.utf8Slice(a, hashPos) + '"') : (isNonAscii === 0 ? buf.latin1Slice(a, hashPos) : buf.utf8Slice(a, hashPos)));
+  const path = resolvePathFastFb(linkCtx.dirStr, linkCtx.dirParts, rel);
+  if (path !== null) {
+    const dest = linkCtx.bySource.get(path);
+    if (dest !== undefined) {
+      const a32 = getSrcI32();
+      if (hasSpec === 0 && hasBs === 0) {
+        const uo = a32[dest.si + 9], un = a32[dest.si + 10];
+        if (hashPos === -1) {
+          u.copyWithin(o, uo, uo + un);
+          cache.set(target, { o: uo, n: un });
+          return o + un;
+        }
+        const fLen = b - hashPos, tot = un + fLen;
+        const ao = writeStrArena(tot, null, uo, un, hashPos, fLen);
+        u = getU8();
+        u.copyWithin(o, ao, ao + tot);
+        cache.set(target, { o: ao, n: tot });
+        return o + tot;
+      }
+      const hi = target.indexOf('#');
+      const frag = hi === -1 ? '' : target.slice(hi);
+      const rawDestUrl = buf.latin1Slice(a32[dest.si + 9], a32[dest.si + 9] + a32[dest.si + 10]) + frag;
+      const jh = jsonEscInner(escapeHtml(rawDestUrl));
+      const res = writeStrArena(0, jh, 0, 0, 0, 0);
+      u = getU8();
+      cache.set(target, res);
+      u.copyWithin(o, res.o, res.o + res.n);
+      return o + res.n;
+    }
+    if (linkCtx.staticPaths.has(path)) {
+      const hi = target.indexOf('#');
+      const frag = hi === -1 ? '' : target.slice(hi);
+      const rawUrl = linkCtx.base + '/' + path + frag;
+      const jh = jsonEscInner(escapeHtml(rawUrl));
+      const res = writeStrArena(0, jh, 0, 0, 0, 0);
+      u = getU8();
+      cache.set(target, res);
+      u.copyWithin(o, res.o, res.o + res.n);
+      return o + res.n;
+    }
+  }
+  linkCtx.broken.add('broken-link ' + linkCtx.sourcePath + ' -> ' + target);
+  cache.set(target, 0);
+  if (hasSpec === 0 && hasBs === 0) { u.copyWithin(o, a, b); return o + (b - a); }
+  return tfCopyCode(a, b, o);
+}
+
+function invokeFallbackStream(input, io) {
+  const rawFiles = input.files;
+  const buf = io.getBuf();
+  for (let j = 0; j < rawFiles.length; j++) {
+    const sf = rawFiles[j];
+    if (sf.rawQStart !== -1 && sf.content === null) sf.content = JSON.parse(buf.utf8Slice(sf.rawQStart, sf.rawQEnd));
+  }
+  const writer = {
+    byte(b) { io.byte(b); },
+    a(s) { io.a(s); },
+    ka(s, comma) { io.ka(s, comma); },
+    kidx(dir, comma) { io.kidx(dir, comma); },
+    s(str) { io.s(str); },
+    j(str) { io.j(jsonEscInner(str)); },
+    b(src) { io.b(src); },
+  };
+  return run(input, writer, io.getU8(), buf);
+}
+
+function renderOneFileFallback(s, saveCopy, env) {
+  const buf = env.getBuf();
+  const fullStr = JSON.parse(buf.utf8Slice(s.rawQStart, s.rawQEnd)).replace(/\r\n?/g, '\n');
+  let fmClose = -1, fp = 3;
+  while ((fp = fullStr.indexOf('\n---', fp)) !== -1) {
+    if (fp + 4 === fullStr.length || fullStr.charCodeAt(fp + 4) === 10) { fmClose = fp; break; }
+    fp += 4;
+  }
+  const rawBody = (fmClose !== -1 && fmClose + 5 <= fullStr.length) ? fullStr.slice(fmClose + 5) : '';
+  const si = s.si, a32 = env.getSrcI32();
+  if (env.needRm(s)) {
+    const words = countWordsStrFallback(rawBody);
+    a32[si + 15] = words <= 200 ? 1 : Math.ceil(words / 200);
+  }
+  const bySource = env.bySource;
+  const fbBySource = {
+    get(k) {
+      const d = bySource.get(k);
+      return d === undefined ? undefined : { url: env.getBuf().latin1Slice(a32[d.si + 9], a32[d.si + 9] + a32[d.si + 10]) };
+    }
+  };
+  const fbCtx = {
+    sourcePath: env.linkCtx.sourcePath, dirStr: env.linkCtx.dirStr, dirParts: env.linkCtx.dirParts,
+    dirCache: new Map(), rel1Cache: null, rel2Cache: null, bySource: fbBySource,
+    staticPaths: env.staticPaths, base: env.base, broken: env.broken,
+  };
+  const htmlStr = renderMarkdownStrFallback(rawBody, fbCtx);
+  const htmlJson = jsonEscInner(htmlStr);
+  const exJson = (_mdExcerpt !== null && _mdExcerpt !== '') ? jsonEscInner(_mdExcerpt) : '';
+  env.finishFallbackFile(s, saveCopy, htmlJson, exJson, _mdToc);
+}
+
 module.exports = {
+  invokeFallbackStream,
+  renderOneFileFallback,
+  resolveRelLinkSlow,
   run,
   renderMarkdownStrFallback,
   countWordsStrFallback,
